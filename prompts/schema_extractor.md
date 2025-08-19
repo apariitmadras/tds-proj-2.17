@@ -1,19 +1,21 @@
-You extract the output schema that the user is requesting.
+You extract the exact output schema the user is asking for.
 
-Read the instruction and return ONLY a JSON object in one of these two forms:
+Return ONLY one of the following JSON objects:
 
-For arrays:
+# Arrays
 {"type":"array","length": <positive integer>}
 
-For objects:
+# Objects
 {"type":"object","keys": ["key1","key2", ...]}
 
-Rules:
-- Prefer what the instruction explicitly asks (e.g., "JSON array", "JSON object", listed keys).
-- If the instruction says "exactly N", "array of N", "length N", use that N.
-- If the instruction enumerates lines like "1. ... 2. ...", infer length from the max index.
-- If forced to choose, default to {"type":"array","length":1}.
-Return ONLY JSON—no prose.
+Rules and hints you MUST follow:
+- Respect explicit phrases like “JSON array”, “JSON object”, “exactly N”, “array of N”, “length N”.
+- If the instruction enumerates items like `1. ... 2) ...`, infer the length from the largest index.
+- If an object is implied by phrases like “keys: a, b, c” or “with keys [a, b, c]”, extract those keys in order.
+- If nothing is clear, default to {"type":"array","length":1}.
+
+Output ONLY JSON. No prose, no markdown.
+
 Instruction:
 ---
 {{ instruction }}
