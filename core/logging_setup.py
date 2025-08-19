@@ -1,27 +1,29 @@
-import logging, json, sys, time, uuid
+import logging, json, sys, time, os
 
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        payload = {
-            "ts": int(time.time() * 1000),
-            "level": record.levelname,
-            "msg": record.getMessage(),
-        }
-        if hasattr(record, "extra"):
-            # Merge user-provided structured fields
-            for k, v in record.extra.items():
-                payload[k] = v
-        return json.dumps(payload, ensure_ascii=False)
+class JSONHandler(logging.StreamHandler):
+    def emit(self, record):
+        try:
+            payload = {
+                "ts": time.time(),
+                "level": record.levelname,
+                "event": getattr(record, "event", record.getMessage()),
+                "msg": record.getMessage(),
+            }
+            if hasattr(record, "extra_fields"): payload.update(record.extra_fields)
+            sys.stdout.write(json.dumps(payload) + "\n")
+        except Exception:
+            super().emit(record)
 
 def configure_logging():
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(JsonFormatter())
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    root.handlers = [handler]
+    root.setLevel(os.getenv("LOG_LEVEL", "INFO"))
+    for h in list(root.handlers): root.removeHandler(h)
+    root.addHandler(JSONHandler())
     return root
 
-def with_fields(**kwargs):
-    rec = logging.LogRecord("logger", logging.INFO, "", 0, "", None, None)
-    rec.extra = kwargs
+def with_fields(event: str, **fields):
+    rec = logging.LogRecord(name="app", level=logging.INFO, pathname=__file__,
+                            lineno=0, msg=event, args=(), exc_info=None)
+    rec.event = event
+    rec.extra_fields = fields
     return rec
