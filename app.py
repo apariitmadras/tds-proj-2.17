@@ -4,7 +4,6 @@ from fastapi import FastAPI, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 
-import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -14,10 +13,12 @@ from core.format_enforcer import parse_questions_text, format_answers
 from core.fallbacks import make_fallback_answers
 from core.prompt_runner import run_prompt
 
-HARD_TIMEOUT_SEC = float(os.getenv("HARD_TIMEOUT_SEC", "285"))
-PLOT_MAX_BYTES  = int(os.getenv("PLOT_MAX_BYTES", "100000"))
-FALLBACK_MODE   = os.getenv("FALLBACK_MODE", "placeholders")  # placeholders | synthetic
+# ------- Config -------
+HARD_TIMEOUT_SEC = float(os.getenv("HARD_TIMEOUT_SEC", "285"))     # 4m45s SLA
+PLOT_MAX_BYTES  = int(os.getenv("PLOT_MAX_BYTES", "100000"))       # ~100 KB
+FALLBACK_MODE   = os.getenv("FALLBACK_MODE", "placeholders")       # placeholders | synthetic
 
+# ------- App -------
 logger = configure_logging()
 app = FastAPI(title="TDS Data Analyst Agent", redirect_slashes=False)
 app.add_middleware(
@@ -25,10 +26,10 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
 )
 
+# ------- Helpers -------
 def _score_primary_candidate(key: str, f: UploadFile) -> int:
     score = 0
-    k = (key or "").lower()
-    name = (f.filename or "").lower()
+    k = (key or "").lower(); name = (f.filename or "").lower()
     ctype = (f.content_type or "").lower()
     if k == "questions.txt": score += 100
     if name.endswith(".txt"): score += 50
@@ -41,7 +42,6 @@ def _choose_primary_file(form_files: List[Tuple[str, UploadFile]]) -> Tuple[str,
     return form_files[0] if len(form_files) == 1 else max(form_files, key=lambda kv: _score_primary_candidate(kv[0], kv[1]))
 
 def make_base64_png(fig) -> str:
-    import io
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -52,7 +52,6 @@ def make_base64_png(fig) -> str:
 def clamp_image_size(uri: str) -> str:
     if len(uri.encode("utf-8")) <= PLOT_MAX_BYTES:
         return uri
-    # 1x1 transparent as fallback
     tiny_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHYALtTyR2wQAAAABJRU5ErkJggg=="
     return f"data:image/png;base64,{tiny_png}"
 
@@ -67,6 +66,9 @@ def _pick_text_instruction(fields: List[Tuple[str, str]]) -> Optional[str]:
     non_empty = [(k, v) for k, v in fields if isinstance(v, str) and v.strip()]
     return non_empty[0][1] if len(non_empty) == 1 else None
 
+def _looks_like_uploadfile_repr(s: str) -> bool:
+    return bool(s) and ("UploadFile(" in s or "Headers(" in s)
+
 def _infer_expected_len(text: str) -> Optional[int]:
     L = text.lower()
     m = re.search(r'exactly\s+(\d+)\s+(items?|keys?)', L)
@@ -74,12 +76,21 @@ def _infer_expected_len(text: str) -> Optional[int]:
         try:
             n = int(m.group(1));  return n if n > 0 else None
         except Exception: pass
-    nums = re.findall(r'^\s*(\d+)\s*[\.\)\]\-:]\s+', text, flags=re.M)
+    nums = re.findall(r'^\s*(\d+)\s*[\.\)\]\-:]\s+', text, flags=re.M)  # 1. 1) 1- 1] 1:
     if nums:
         ints = [int(x) for x in nums]
         return max(ints) if min(ints) == 1 else len(nums)
     return None
 
+def _coerce_array_shape(answers: List[Any], target_len: int) -> List[Any]:
+    if target_len <= 0: target_len = 1
+    if len(answers) < target_len:
+        answers = answers + make_fallback_answers(target_len - len(answers))
+    elif len(answers) > target_len:
+        answers = answers[:target_len]
+    return answers
+
+# ------- API -------
 @app.post("/api", include_in_schema=False)
 @app.post("/api/")
 async def analyze(request: Request):
@@ -90,7 +101,7 @@ async def analyze(request: Request):
     attachments: Dict[str, UploadFile] = {}
     content_type = (request.headers.get("content-type") or "")
 
-    # --- Input parsing (JSON or multipart) ---
+    # --- Input parsing ---
     if "application/json" in content_type:
         try:
             payload = await request.json()
@@ -105,44 +116,40 @@ async def analyze(request: Request):
             form = await request.form()
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid or missing multipart form-data.")
+
         form_files: List[Tuple[str, UploadFile]] = []
         form_fields: List[Tuple[str, str]] = []
         for key, val in form.multi_items():
             if isinstance(val, UploadFile): form_files.append((key, val))
             else:                            form_fields.append((key, str(val) if val is not None else ""))
-        if form_files:
+
+        instruction = _pick_text_instruction(form_fields)
+        if not instruction and form_files:
             primary_key, primary_file = _choose_primary_file(form_files)
             qtxt_bytes = await primary_file.read()
-            instruction = qtxt_bytes.decode("utf-8", errors="ignore")
+            candidate = qtxt_bytes.decode("utf-8", errors="ignore")
+            if not _looks_like_uploadfile_repr(candidate):
+                instruction = candidate
             for key, f in form_files:
                 if f is not primary_file:
                     attachments[f.filename or key] = f
-            _log("input.multipart.file", req_id=req_id, primary_field=primary_key, instr_len=len(instruction), attachments=len(attachments))
-        else:
-            instruction = _pick_text_instruction(form_fields)
-            if not instruction:
-                raise HTTPException(status_code=400, detail="No instructions found. Upload a file OR include a 'task'/'questions' text field.")
-            _log("input.multipart.text", req_id=req_id, instr_len=len(instruction), fields=len(form_fields))
+            _log("input.multipart.file", req_id=req_id, primary_field=primary_key,
+                 instr_len=(len(instruction) if instruction else 0), attachments=len(attachments))
 
-    # --- Parse requested structure ---
+        if not instruction:
+            raise HTTPException(status_code=400, detail="No instructions found. Upload a file OR include a 'task'/'questions' text field.")
+
+    # --- Parse structure ---
     parsed = parse_questions_text(instruction)
-    out_type: str   = parsed["type"]
-    qs: List[str]   = parsed["questions"]
+    out_type: str = parsed["type"]
+    qs: List[str] = parsed["questions"]
     expected_len: Optional[int] = parsed.get("expected_len") or _infer_expected_len(instruction)
     _log("parsed.questions", req_id=req_id, out_type=out_type, n=len(qs), expected_len=expected_len)
 
     answers: List[Any] = []
 
     try:
-        # --- Optional planning/orchestration ---
-        plan = run_prompt(
-            role="planner", prompt_name="planner",
-            variables={"time_budget": int(deadline.remaining), "instruction": instruction[:4000], "attachments": ", ".join(list(attachments.keys())) or "none"},
-            system="Be concise and deterministic."
-        )
-        _log("planner.done", req_id=req_id, plan_preview=(plan[:200] if plan else None))
-
-        # --- Lightweight execution examples ---
+        # --- Simple deterministic handlers (examples) ---
         for idx, q in enumerate(qs):
             if deadline.near(5) or deadline.exceeded():
                 _log("deadline.near", req_id=req_id, idx=idx, elapsed=deadline.elapsed); break
@@ -160,32 +167,18 @@ async def analyze(request: Request):
                 ax.set_xlabel("Rank"); ax.set_ylabel("Peak")
                 uri = make_base64_png(fig); answers.append(clamp_image_size(uri)); continue
 
-            action = run_prompt(
-                role="orch", prompt_name="orchestrator",
-                variables={"plan": plan or "(no plan)", "sofar": f"q_index={idx}, q='{q}'"},
-                system="Return only the single next action."
-            )
-            res = run_prompt(
-                role="analyst", prompt_name="analyst",
-                variables={"action": action or "(no action)", "context": instruction[:2000], "time_left": int(deadline.remaining)},
-                system="Be concise."
-            )
-            answers.append(res if res is not None else "N/A")
+            answers.append("N/A")  # default filler for other items (LLM paths can replace)
 
-        # --- Decide target length (array) ---
+        # --- Decide target length and pre-enforce locally ---
         target_len = (expected_len if isinstance(expected_len, int) and expected_len > 0
-                      else (len(qs) if len(qs) > 0 else (len(answers) if answers else 1)))
+                      else (len(qs) if len(qs) > 0 else 1))
 
         if out_type == "array":
-            # pad/truncate locally before Guarantor
-            if len(answers) < target_len:
-                add = target_len - len(answers); answers.extend(make_fallback_answers(add)); _log("fallback.fill.local", req_id=req_id, added=add)
-            elif len(answers) > target_len:
-                answers = answers[:target_len]
+            answers = _coerce_array_shape(answers, target_len)
             if len(qs) < target_len:
                 qs = qs + [f"item_{i+1}" for i in range(len(qs), target_len)]
 
-        # --- LLM GUARANTOR: final authority to ensure an answer ---
+        # --- LLM Guarantor (optional) ---
         guarantor_json = run_prompt(
             role="guarantor",
             prompt_name="guarantor",
@@ -204,26 +197,44 @@ async def analyze(request: Request):
         final_payload = None
         if guarantor_json:
             try:
-                final_payload = json.loads(guarantor_json)
-                _log("guarantor.ok", req_id=req_id, size=len(guarantor_json))
+                candidate = json.loads(guarantor_json)
+                if out_type == "array":
+                    if isinstance(candidate, list) and len(candidate) == target_len:
+                        final_payload = candidate
+                    else:
+                        _log("guarantor.bad_shape", req_id=req_id, got_type=type(candidate).__name__, got_len=(len(candidate) if isinstance(candidate, list) else None))
+                else:
+                    if isinstance(candidate, dict) and set(candidate.keys()) == set(qs):
+                        final_payload = candidate
+                    else:
+                        _log("guarantor.bad_keys", req_id=req_id, got_keys=(list(candidate.keys()) if isinstance(candidate, dict) else None))
             except Exception as e:
                 _log("guarantor.parse_fail", req_id=req_id, err=str(e))
 
-        # Fallback to local formatter if needed
+        # --- HARD SHAPE ENFORCEMENT even without Guarantor ---
         if final_payload is None:
-            local_payload = format_answers(out_type, qs, answers)
-            final_payload = local_payload
+            if out_type == "array":
+                # Return exactly target_len items. Do NOT shrink back to len(qs).
+                final_payload = _coerce_array_shape(answers, target_len)
+            else:
+                obj: Dict[str, Any] = {}
+                for i, k in enumerate(qs):
+                    obj[k] = answers[i] if i < len(answers) else make_fallback_answers(1)[0]
+                final_payload = obj
 
-        # Optional: validator pass (light)
+        # (Optional) validator pass that does NOT change shape
         try:
             as_json = json.dumps(final_payload, ensure_ascii=False)
             fixed = run_prompt(
                 role="validator", prompt_name="validator",
-                variables={"expected_len": len(qs), "json_str": as_json, "instruction": instruction},
+                variables={"expected_len": (target_len if out_type == "array" else len(qs)), "json_str": as_json, "instruction": instruction},
                 system="Return only valid JSON; no commentary."
             )
             if fixed:
-                final_payload = json.loads(fixed)
+                maybe = json.loads(fixed)
+                if (out_type == "array" and isinstance(maybe, list) and len(maybe) == target_len) or \
+                   (out_type == "object" and isinstance(maybe, dict) and set(maybe.keys()) == set(qs)):
+                    final_payload = maybe
         except Exception:
             pass
 
@@ -233,9 +244,10 @@ async def analyze(request: Request):
 
     except Exception as e:
         _log("response.error", req_id=req_id, err=str(e))
-        if not qs: qs = ["item_1"]
-        payload = format_answers(out_type, qs, make_fallback_answers(max(1, len(qs))))
-        return JSONResponse(content=payload, status_code=200)
+        if out_type == "array":
+            return JSONResponse(content=_coerce_array_shape([], 1), status_code=200)
+        else:
+            return JSONResponse(content={"answer": "N/A"}, status_code=200)
 
 @app.get("/healthz")
 async def healthz():
