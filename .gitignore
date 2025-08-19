@@ -1,7 +1,46 @@
+# --- Python bytecode / caches ---
 __pycache__/
-*.pyc
-.env
+*.py[cod]
+*.pyo
+*.pyd
+
+# --- Virtual envs & local config ---
 .venv/
+venv/
+env/
+.env
+.env.*
 .env.local
+.python-version
+
+# --- Packaging / build artifacts ---
+build/
+dist/
+.eggs/
+*.egg-info/
+
+# --- Test / tooling caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+
+# --- Notebooks (optional: delete these 2 lines if you want to commit notebooks) ---
+.ipynb_checkpoints/
+*.ipynb
+
+# --- OS cruft ---
 .DS_Store
+Thumbs.db
+
+# --- Logs ---
 *.log
+
+# --- Misc (in case you add a small frontend) ---
+node_modules/
