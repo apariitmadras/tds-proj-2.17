@@ -20,8 +20,9 @@ HARD_TIMEOUT_SEC = float(os.getenv("HARD_TIMEOUT_SEC", "285"))
 PLOT_MAX_BYTES = int(os.getenv("PLOT_MAX_BYTES", "100000"))
 
 # ----- App & Logging -----
+# redirect_slashes=False prevents Starlette from auto-redirecting /api <-> /api/
 logger = configure_logging()
-app = FastAPI(title="TDS Data Analyst Agent")
+app = FastAPI(title="TDS Data Analyst Agent", redirect_slashes=False)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
@@ -74,6 +75,8 @@ def _log(event: str, **fields):
     logger.handle(rec)
 
 # ----- API -----
+# Accept both /api and /api/ to avoid 307 redirect -> 405 issues
+@app.post("/api", include_in_schema=False)
 @app.post("/api/")
 async def analyze(request: Request):
     deadline = Deadline(HARD_TIMEOUT_SEC)
@@ -109,7 +112,6 @@ async def analyze(request: Request):
                 form_files.append((key, val))
 
         if not form_files:
-            # NOTE: single-line detail string to avoid SyntaxError
             raise HTTPException(
                 status_code=400,
                 detail="No files uploaded. Upload at least one text-like file containing your instructions. "
@@ -214,7 +216,8 @@ async def analyze(request: Request):
             pass
 
         resp = JSONResponse(content=payload)
-        _log("response.ok", req_id=req_id, elapsed=Deadline(HARD_TIMEOUT_SEC).elapsed, bytes=len(resp.body))
+        # BUGFIX: use the current deadline (not a new one) for elapsed logging
+        _log("response.ok", req_id=req_id, elapsed=deadline.elapsed, bytes=len(resp.body))
         return resp
 
     except Exception as e:
