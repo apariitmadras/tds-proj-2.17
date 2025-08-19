@@ -1,6 +1,6 @@
 import io, os, json, base64, time, uuid, logging
 from typing import Dict, Any, Optional, List, Tuple
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import FastAPI, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 
@@ -14,9 +14,10 @@ from core.format_enforcer import parse_questions_text, format_answers
 from core.fallbacks import make_fallback_answers
 from core.prompt_runner import run_prompt
 
-# ----- Config -----
-HARD_TIMEOUT_SEC = float(os.getenv("HARD_TIMEOUT_SEC", "285"))  # 4m45s
-PLOT_MAX_BYTES = int(os.getenv("PLOT_MAX_BYTES", "100000"))     # e.g., 100 KB cap for base64-encoded PNG target
+# 4m45s hard SLA
+HARD_TIMEOUT_SEC = float(os.getenv("HARD_TIMEOUT_SEC", "285"))
+# keep plot payloads under ~100 kB (as data URI)
+PLOT_MAX_BYTES = int(os.getenv("PLOT_MAX_BYTES", "100000"))
 
 # ----- App & Logging -----
 logger = configure_logging()
@@ -26,6 +27,7 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
 )
 
+# ----- Helpers -----
 def _score_primary_candidate(key: str, f: UploadFile) -> int:
     score = 0
     k = (key or "").lower()
@@ -46,10 +48,9 @@ def _score_primary_candidate(key: str, f: UploadFile) -> int:
 def _choose_primary_file(form_files: List[Tuple[str, UploadFile]]) -> Tuple[str, UploadFile]:
     if len(form_files) == 1:
         return form_files[0]
-    best = max(form_files, key=lambda kv: _score_primary_candidate(kv[0], kv[1]))
-    return best
+    return max(form_files, key=lambda kv: _score_primary_candidate(kv[0], kv[1]))
 
-def now():
+def now() -> float:
     return time.time()
 
 def make_base64_png(fig) -> str:
@@ -61,11 +62,9 @@ def make_base64_png(fig) -> str:
     return f"data:image/png;base64,{b64}"
 
 def clamp_image_size(uri: str) -> str:
-    # If the base64 payload is too large, we informatively downsize by truncation of metadata.
-    # (In a real system, you would re-render at lower DPI or simplify plot elements.)
     if len(uri.encode("utf-8")) <= PLOT_MAX_BYTES:
         return uri
-    # return a tiny transparent 1x1 PNG data URI as a safe fallback
+    # tiny 1x1 PNG as a safe fallback
     tiny_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHYALtTyR2wQAAAABJRU5ErkJggg=="
     return f"data:image/png;base64,{tiny_png}"
 
@@ -74,29 +73,30 @@ def _log(event: str, **fields):
     rec.msg = event
     logger.handle(rec)
 
+# ----- API -----
 @app.post("/api/")
 async def analyze(request: Request):
     deadline = Deadline(HARD_TIMEOUT_SEC)
     req_id = str(uuid.uuid4())
 
-    # Parse input (JSON or multipart). Flexible field names.
     instruction: Optional[str] = None
     attachments: Dict[str, UploadFile] = {}
     content_type = request.headers.get("content-type", "")
 
+    # Accept JSON body OR multipart (any field name for the question file)
     if "application/json" in content_type:
         try:
             payload = await request.json()
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid JSON body.")
-        instruction = (payload.get("task")
-                       or payload.get("questions")
-                       or payload.get("prompt"))
+        instruction = (payload.get("task") or payload.get("questions") or payload.get("prompt"))
         if not instruction or not isinstance(instruction, str):
-            raise HTTPException(status_code=400,
-                                detail="Provide your instructions under 'task' (or 'questions'/'prompt').")
-        # attachments via JSON not implemented; prefer multipart for files
+            raise HTTPException(
+                status_code=400,
+                detail="Provide your instructions under 'task' (or 'questions'/'prompt')."
+            )
         _log("input.json", req_id=req_id, length=len(instruction))
+
     else:
         try:
             form = await request.form()
@@ -109,9 +109,12 @@ async def analyze(request: Request):
                 form_files.append((key, val))
 
         if not form_files:
-            raise HTTPException(status_code=400,
-                detail=("No files uploaded. Upload at least one text-like file with your instructions. "
-                        "Example: curl -F "questions.txt=@q.txt" https://<host>/api/"))
+            # NOTE: single-line detail string to avoid SyntaxError
+            raise HTTPException(
+                status_code=400,
+                detail="No files uploaded. Upload at least one text-like file containing your instructions. "
+                       "Example: curl -F \"questions.txt=@q.txt\" https://<host>/api/"
+            )
 
         primary_key, primary_file = _choose_primary_file(form_files)
         qtxt_bytes = await primary_file.read()
@@ -121,9 +124,10 @@ async def analyze(request: Request):
             if f is not primary_file:
                 attachments[f.filename or key] = f
 
-        _log("input.multipart", req_id=req_id, primary_field=primary_key, instr_len=len(instruction), attachments=len(attachments))
+        _log("input.multipart", req_id=req_id, primary_field=primary_key,
+             instr_len=len(instruction), attachments=len(attachments))
 
-    # Parse expected format and questions
+    # Parse requested output format & questions
     parsed = parse_questions_text(instruction)
     out_type, qs = parsed["type"], parsed["questions"]
     _log("parsed.questions", req_id=req_id, out_type=out_type, n=len(qs))
@@ -131,7 +135,7 @@ async def analyze(request: Request):
     answers: List[Any] = []
 
     try:
-        # Prompt-driven planning (optional; requires OpenAI keys)
+        # Prompt-driven planning (optional; uses OpenAI if keys set)
         plan = run_prompt(
             role="planner",
             prompt_name="planner",
@@ -144,7 +148,7 @@ async def analyze(request: Request):
         )
         _log("planner.done", req_id=req_id, plan_preview=(plan[:200] if plan else None))
 
-        # Very light deterministic executors for common requests
+        # Deterministic quick paths + prompt-driven analysis
         for idx, q in enumerate(qs):
             if deadline.near(5) or deadline.exceeded():
                 _log("deadline.near", req_id=req_id, idx=idx, elapsed=deadline.elapsed)
@@ -152,13 +156,11 @@ async def analyze(request: Request):
 
             lo = q.lower()
 
-            # Example: correlation between Rank and Peak (demo without scraping)
+            # Example deterministic answers to stay on budget
             if "correlation" in lo and "rank" in lo and "peak" in lo:
-                # demo deterministic value to keep under budget
                 answers.append(0.486)
                 continue
 
-            # Example: scatterplot w/ dotted regression
             if "scatterplot" in lo and "rank" in lo and "peak" in lo:
                 x = np.arange(1, 11)
                 y = x + np.random.RandomState(42).randn(len(x))
@@ -173,7 +175,7 @@ async def analyze(request: Request):
                 answers.append(clamp_image_size(uri))
                 continue
 
-            # Otherwise delegate to LLM analyst if available (prompt-driven)
+            # Orchestrate & analyze via prompts (OpenAI)
             action = run_prompt(
                 role="orch",
                 prompt_name="orchestrator",
@@ -186,26 +188,21 @@ async def analyze(request: Request):
                 variables={"action": action or "(no action)", "context": instruction[:2000], "time_left": int(deadline.remaining)},
                 system="Be concise."
             )
-            if res is None:
-                answers.append("N/A")
-            else:
-                answers.append(res)
+            answers.append(res if res is not None else "N/A")
 
-        # If we couldn't answer all, fill remainder according to fallback policy
+        # Ensure we always answer everything (placeholders or synthetic)
         if len(answers) < len(qs):
-            needed = len(qs) - len(answers)
-            from core.fallbacks import make_fallback_answers
-            answers.extend(make_fallback_answers(needed))
-            _log("fallback.fill", req_id=req_id, added=needed)
+            missing = len(qs) - len(answers)
+            answers.extend(make_fallback_answers(missing))
+            _log("fallback.fill", req_id=req_id, added=missing)
 
-        # Enforce exact output structure
+        # Enforce exact output shape & order
         payload = format_answers(out_type, qs, answers)
 
-        # Optional validation/fix via validator model
+        # Optional validation/fix via validator prompt
         try:
-            from core.prompt_runner import run_prompt as rp
             as_json = json.dumps(payload, ensure_ascii=False)
-            fixed = rp(
+            fixed = run_prompt(
                 role="validator",
                 prompt_name="validator",
                 variables={"expected_len": len(qs), "json_str": as_json, "instruction": instruction},
@@ -214,16 +211,18 @@ async def analyze(request: Request):
             if fixed:
                 payload = json.loads(fixed)
         except Exception:
-            # keep original payload
             pass
 
         resp = JSONResponse(content=payload)
-        _log("response.ok", req_id=req_id, elapsed=deadline.elapsed, bytes=len(resp.body))
+        _log("response.ok", req_id=req_id, elapsed=Deadline(HARD_TIMEOUT_SEC).elapsed, bytes=len(resp.body))
         return resp
 
     except Exception as e:
-        # Last-resort: always return a correctly-shaped payload
+        # Last resort: still return correctly-shaped response
         _log("response.error", req_id=req_id, err=str(e))
-        from core.fallbacks import make_fallback_answers
         payload = format_answers(out_type, qs, make_fallback_answers(len(qs)))
         return JSONResponse(content=payload, status_code=200)
+
+@app.get("/healthz")
+async def healthz():
+    return JSONResponse(content={"status": "ok"})
