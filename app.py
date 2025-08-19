@@ -74,6 +74,18 @@ def _log(event: str, **fields):
     rec.msg = event
     logger.handle(rec)
 
+def _pick_text_instruction(fields: List[Tuple[str, str]]) -> Optional[str]:
+    # Priority keys commonly used
+    pri = {"task", "questions", "prompt", "q", "instruction"}
+    for k, v in fields:
+        if k.lower() in pri and isinstance(v, str) and v.strip():
+            return v
+    # Otherwise, if there is exactly one non-empty text field, take it
+    non_empty = [(k, v) for k, v in fields if isinstance(v, str) and v.strip()]
+    if len(non_empty) == 1:
+        return non_empty[0][1]
+    return None
+
 # ----- API -----
 # Accept both /api and /api/ to avoid 307 redirect -> 405 issues
 @app.post("/api", include_in_schema=False)
@@ -84,7 +96,7 @@ async def analyze(request: Request):
 
     instruction: Optional[str] = None
     attachments: Dict[str, UploadFile] = {}
-    content_type = request.headers.get("content-type", "")
+    content_type = (request.headers.get("content-type") or "")
 
     # Accept JSON body OR multipart (any field name for the question file)
     if "application/json" in content_type:
@@ -106,28 +118,36 @@ async def analyze(request: Request):
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid or missing multipart form-data.")
 
+        # Separate files and text fields
         form_files: List[Tuple[str, UploadFile]] = []
+        form_fields: List[Tuple[str, str]] = []
         for key, val in form.multi_items():
             if isinstance(val, UploadFile):
                 form_files.append((key, val))
+            else:
+                # Starlette returns strings for non-file fields
+                form_fields.append((key, str(val) if val is not None else ""))
 
-        if not form_files:
-            raise HTTPException(
-                status_code=400,
-                detail="No files uploaded. Upload at least one text-like file containing your instructions. "
-                       "Example: curl -F \"questions.txt=@q.txt\" https://<host>/api/"
-            )
-
-        primary_key, primary_file = _choose_primary_file(form_files)
-        qtxt_bytes = await primary_file.read()
-        instruction = qtxt_bytes.decode("utf-8", errors="ignore")
-
-        for key, f in form_files:
-            if f is not primary_file:
-                attachments[f.filename or key] = f
-
-        _log("input.multipart", req_id=req_id, primary_field=primary_key,
-             instr_len=len(instruction), attachments=len(attachments))
+        if form_files:
+            # Choose a primary file for instruction
+            primary_key, primary_file = _choose_primary_file(form_files)
+            qtxt_bytes = await primary_file.read()
+            instruction = qtxt_bytes.decode("utf-8", errors="ignore")
+            # The rest become attachments
+            for key, f in form_files:
+                if f is not primary_file:
+                    attachments[f.filename or key] = f
+            _log("input.multipart.file", req_id=req_id, primary_field=primary_key,
+                 instr_len=len(instruction), attachments=len(attachments))
+        else:
+            # No files — try to pick instruction from text fields (fix for your 400)
+            instruction = _pick_text_instruction(form_fields)
+            if not instruction:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No instructions found. Upload a file (e.g., questions.txt) OR include a text field like 'task'/'questions' with your prompt."
+                )
+            _log("input.multipart.text", req_id=req_id, instr_len=len(instruction), fields=len(form_fields))
 
     # Parse requested output format & questions
     parsed = parse_questions_text(instruction)
@@ -168,64 +188,4 @@ async def analyze(request: Request):
                 y = x + np.random.RandomState(42).randn(len(x))
                 fig = plt.figure()
                 ax = fig.add_subplot(111)
-                ax.scatter(x, y)
-                coef = np.polyfit(x, y, 1)
-                yy = coef[0]*x + coef[1]
-                ax.plot(x, yy, linestyle=":", color="red")
-                ax.set_xlabel("Rank"); ax.set_ylabel("Peak")
-                uri = make_base64_png(fig)
-                answers.append(clamp_image_size(uri))
-                continue
-
-            # Orchestrate & analyze via prompts (OpenAI)
-            action = run_prompt(
-                role="orch",
-                prompt_name="orchestrator",
-                variables={"plan": plan or "(no plan)", "sofar": f"q_index={idx}, q='{q}'"},
-                system="Return only the single next action."
-            )
-            res = run_prompt(
-                role="analyst",
-                prompt_name="analyst",
-                variables={"action": action or "(no action)", "context": instruction[:2000], "time_left": int(deadline.remaining)},
-                system="Be concise."
-            )
-            answers.append(res if res is not None else "N/A")
-
-        # Ensure we always answer everything (placeholders or synthetic)
-        if len(answers) < len(qs):
-            missing = len(qs) - len(answers)
-            answers.extend(make_fallback_answers(missing))
-            _log("fallback.fill", req_id=req_id, added=missing)
-
-        # Enforce exact output shape & order
-        payload = format_answers(out_type, qs, answers)
-
-        # Optional validation/fix via validator prompt
-        try:
-            as_json = json.dumps(payload, ensure_ascii=False)
-            fixed = run_prompt(
-                role="validator",
-                prompt_name="validator",
-                variables={"expected_len": len(qs), "json_str": as_json, "instruction": instruction},
-                system="Return only valid JSON; no commentary."
-            )
-            if fixed:
-                payload = json.loads(fixed)
-        except Exception:
-            pass
-
-        resp = JSONResponse(content=payload)
-        # BUGFIX: use the current deadline (not a new one) for elapsed logging
-        _log("response.ok", req_id=req_id, elapsed=deadline.elapsed, bytes=len(resp.body))
-        return resp
-
-    except Exception as e:
-        # Last resort: still return correctly-shaped response
-        _log("response.error", req_id=req_id, err=str(e))
-        payload = format_answers(out_type, qs, make_fallback_answers(len(qs)))
-        return JSONResponse(content=payload, status_code=200)
-
-@app.get("/healthz")
-async def healthz():
-    return JSONResponse(content={"status": "ok"})
+                ax.scat
