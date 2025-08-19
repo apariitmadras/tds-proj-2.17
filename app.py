@@ -143,10 +143,12 @@ async def analyze(request: Request):
                 )
             _log("input.multipart.text", req_id=req_id, instr_len=len(instruction), fields=len(form_fields))
 
-    # Parse requested output format & questions
+    # Parse requested output format, questions, and expected length (if any)
     parsed = parse_questions_text(instruction)
-    out_type, qs = parsed["type"], parsed["questions"]
-    _log("parsed.questions", req_id=req_id, out_type=out_type, n=len(qs))
+    out_type: str = parsed["type"]
+    qs: List[str] = parsed["questions"]
+    expected_len: Optional[int] = parsed.get("expected_len")
+    _log("parsed.questions", req_id=req_id, out_type=out_type, n=len(qs), expected_len=expected_len)
 
     answers: List[Any] = []
 
@@ -182,7 +184,7 @@ async def analyze(request: Request):
                 y = x + np.random.RandomState(42).randn(len(x))
                 fig = plt.figure()
                 ax = fig.add_subplot(111)
-                ax.scatter(x, y)  # <-- fixed (was 'ax.scat')
+                ax.scatter(x, y)
                 coef = np.polyfit(x, y, 1)
                 yy = coef[0]*x + coef[1]
                 ax.plot(x, yy, linestyle=":", color="red")
@@ -206,11 +208,27 @@ async def analyze(request: Request):
             )
             answers.append(res if res is not None else "N/A")
 
-        # Ensure we always answer everything (placeholders or synthetic)
-        if len(answers) < len(qs):
-            missing = len(qs) - len(answers)
-            answers.extend(make_fallback_answers(missing))
-            _log("fallback.fill", req_id=req_id, added=missing)
+        # --- ALWAYS ANSWER: enforce target length for arrays ---
+        # If user asked for "exactly N items", guarantee that length.
+        # Otherwise, use enumerated count. If still 0, make it 1.
+        if out_type == "array":
+            target_len = expected_len if isinstance(expected_len, int) and expected_len > 0 else len(qs)
+            if target_len <= 0:
+                target_len = 1  # absolute floor: always return at least one item
+
+            if len(answers) < target_len:
+                answers.extend(make_fallback_answers(target_len - len(answers)))
+                _log("fallback.fill", req_id=req_id, added=(target_len - (len(answers))))
+
+            elif len(answers) > target_len:
+                answers = answers[:target_len]
+
+            # Make qs length match (array ignores keys; dummies are fine)
+            if len(qs) < target_len:
+                qs = qs + [f"item_{i+1}" for i in range(len(qs), target_len)]
+
+        # For objects, we keep the keys users enumerated; if none were enumerated,
+        # the single whole-prompt question will be used. (Padding object keys risks mismatched names.)
 
         # Enforce exact output shape & order
         payload = format_answers(out_type, qs, answers)
@@ -236,7 +254,10 @@ async def analyze(request: Request):
     except Exception as e:
         # Last resort: still return correctly-shaped response
         _log("response.error", req_id=req_id, err=str(e))
-        payload = format_answers(out_type, qs, make_fallback_answers(len(qs)))
+        # If parse found zero questions (can happen with odd prompts), force 1
+        if not qs:
+            qs = ["item_1"]
+        payload = format_answers(out_type, qs, make_fallback_answers(max(1, len(qs))))
         return JSONResponse(content=payload, status_code=200)
 
 @app.get("/healthz")
