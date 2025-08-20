@@ -1,8 +1,0 @@
-# railway.toml
-[build]
-builder = "Docker"
-
-[deploy]
-startCommand = "python app.py"
-healthcheckPath = "/healthz"
-healthcheckTimeout = 30
