@@ -1,2 +1,0 @@
-Return only a JSON array of strings with exactly 1 item:
-1. ok
