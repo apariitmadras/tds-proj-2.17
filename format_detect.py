@@ -41,7 +41,7 @@ def _heuristic_schema(text: str) -> Dict[str, Any]:
         if "correlation" in sL: return "corr"
         if "png" in sL and "base64" in sL: return "png"
         if any(w in sL for w in ["scatterplot","plot","chart","graph"]): return "png"
-        if "year" in sL: return "year"
+        if "year" in sL: return "int"
         if "date" in sL: return "date"
         if "url" in sL or "link" in sL: return "url"
         if "title" in sL: return "title"
