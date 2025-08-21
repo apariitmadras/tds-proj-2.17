@@ -1,7 +1,7 @@
 import os, io, re, json, uuid, base64, time, logging, sys, random
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Request, UploadFile, HTTPException, Header, Response, File, Form
+from fastapi import FastAPI, Request, UploadFile, HTTPException, Header, Response
 from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 from PIL import Image, ImageDraw
@@ -169,49 +169,73 @@ def _make_plot_uri() -> str:
         return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHYALtTyR2wQAAAABJRU5ErkJggg=="
     return uri
 
-# -------------------- Input selection helpers --------------------
+# -------------------- Instruction extraction --------------------
 PREFERRED_TEXT_KEYS = {"task", "questions", "prompt", "q", "instruction", "task_text"}
+PRIMARY_FILE_KEYS   = ("file", "questions.txt")
 
-async def _pick_instruction_from_params(
-    task: Optional[str], questions: Optional[str], prompt: Optional[str],
-    q: Optional[str], instruction: Optional[str]
-) -> Optional[str]:
-    for key, val in [
-        ("task", task), ("questions", questions), ("prompt", prompt),
-        ("q", q), ("instruction", instruction)
-    ]:
-        if isinstance(val, str) and val.strip():
-            _log("input.form_param", field=key, length=len(val))
-            return val.strip()
-    return None
-
-async def _pick_instruction_from_files(
-    file: Optional[UploadFile], questions_txt: Optional[UploadFile]
-) -> Optional[str]:
-    # priority: 'file' then 'questions.txt'
-    for key, val in [("file", file), ("questions.txt", questions_txt)]:
-        if isinstance(val, UploadFile):
-            try:
-                data = await val.read()
-                text = (data or b"").decode("utf-8", errors="ignore").strip()
-                if text and not _looks_like_uploadfile_repr(text):
-                    _log("input.file_named", field=key, length=len(text), filename=getattr(val, "filename", None))
-                    return text
-            except Exception as e:
-                _log("input.file_named_error", field=key, err=str(e))
-    return None
-
-async def _pick_instruction_from_form_any(request: Request) -> Optional[str]:
+async def _read_instruction_from_request(request: Request) -> str:
     """
-    Fallback scan: prefer ANY UploadFile; if none, pick a non-trivial text field.
+    Priority:
+      1) JSON body (task/prompt/etc.)
+      2) Preferred text fields in multipart/form
+      3) PRIMARY named file parts: 'file', then 'questions.txt'
+      4) Any other file with non-empty UTF-8 text
+      5) Any leftover text field (ignore tiny flags like 'mode=mock')
+      6) Synth 1-item instruction (unless STRICT_INPUT=1)
     """
+    content_type = (request.headers.get("content-type") or "").lower()
+
+    # 1) JSON
+    if "application/json" in content_type:
+        try:
+            payload = await request.json()
+        except Exception:
+            if STRICT_INPUT:
+                raise HTTPException(status_code=400, detail="Invalid JSON body.")
+            _log("input.json_parse_failed"); 
+            return "Return ONLY a JSON array with exactly 1 item:\n1. answer"
+        for k in PREFERRED_TEXT_KEYS:
+            v = payload.get(k)
+            if isinstance(v, str) and v.strip():
+                _log("input.json", field=k, length=len(v))
+                return v.strip()
+        if STRICT_INPUT:
+            raise HTTPException(status_code=400, detail="Provide instructions under one of: " + ", ".join(sorted(PREFERRED_TEXT_KEYS)))
+        _log("input.json_missing", keys=list(payload.keys()) if isinstance(payload, dict) else "n/a")
+        return "Return ONLY a JSON array with exactly 1 item:\n1. answer"
+
+    # 2–5) Multipart / form
     try:
         form = await request.form()
-    except Exception as e:
-        _log("input.form_scan_error", err=str(e))
-        return None
+    except Exception:
+        if STRICT_INPUT:
+            raise HTTPException(status_code=400, detail="Invalid or missing multipart form-data.")
+        _log("input.form_parse_failed")
+        return "Return ONLY a JSON array with exactly 1 item:\n1. answer"
 
-    # First: ANY file part
+    # 2) Preferred text fields first
+    for key, val in form.multi_items():
+        if not isinstance(val, UploadFile):
+            s = str(val or "").strip()
+            if s and key.lower() in PREFERRED_TEXT_KEYS:
+                _log("input.multipart.text_preferred", field=key, length=len(s))
+                return s
+
+    # 3) PRIMARY named file parts, in order
+    for primary in PRIMARY_FILE_KEYS:
+        if primary in form:
+            val = form[primary]
+            if isinstance(val, UploadFile):
+                try:
+                    data = await val.read()
+                    text = (data or b"").decode("utf-8", errors="ignore").strip()
+                    if text and not _looks_like_uploadfile_repr(text):
+                        _log("input.multipart.file_primary", field=primary, length=len(text), filename=getattr(val, "filename", None))
+                        return text
+                except Exception as e:
+                    _log("input.multipart.file_primary_error", field=primary, err=str(e))
+
+    # 4) Any other file part with text
     for key, val in form.multi_items():
         if isinstance(val, UploadFile):
             try:
@@ -224,14 +248,19 @@ async def _pick_instruction_from_form_any(request: Request) -> Optional[str]:
                 _log("input.multipart.file_any_error", field=key, err=str(e))
                 continue
 
-    # Then: any remaining text field (ignore tiny flag-like values)
+    # 5) Any leftover non-trivial text field (ignore flags)
     for key, val in form.multi_items():
         if not isinstance(val, UploadFile):
             s = str(val or "").strip()
             if s and key.lower() not in {"mode", "mock", "x-mock"} and len(s) >= 8:
                 _log("input.multipart.text_any", field=key, length=len(s))
                 return s
-    return None
+
+    # 6) Final fallback
+    if STRICT_INPUT:
+        raise HTTPException(status_code=400, detail="No instructions found. Upload a text file or include a 'task' field.")
+    _log("input.missing_graceful", synthesized=True)
+    return "Return ONLY a JSON array with exactly 1 item:\n1. answer"
 
 # -------------------- API --------------------
 @app.post("/api", include_in_schema=False)
@@ -239,76 +268,30 @@ async def _pick_instruction_from_form_any(request: Request) -> Optional[str]:
 async def api(
     request: Request,
     response: Response,
-    # Accept common form params
-    task: Optional[str] = Form(None),
-    questions: Optional[str] = Form(None),
-    prompt: Optional[str] = Form(None),
-    q: Optional[str] = Form(None),
-    instruction: Optional[str] = Form(None),
-    # Accept common file names
-    file: UploadFile = File(None),
-    questions_txt: UploadFile = File(None, alias="questions.txt"),
-    # Headers / query
     x_mock: Optional[str] = Header(None),
     mode: Optional[str] = None,
 ):
     deadline = Deadline(HARD_TIMEOUT_SEC)
     req_id = str(uuid.uuid4())
 
-    # 0) JSON body gets handled by FastAPI automatically only if we declare a model,
-    # so we read raw JSON manually if needed.
-    content_type = (request.headers.get("content-type") or "")
-    if "application/json" in content_type:
-        try:
-            payload = await request.json()
-            for k in PREFERRED_TEXT_KEYS:
-                v = payload.get(k)
-                if isinstance(v, str) and v.strip():
-                    _log("input.json", field=k, length=len(v))
-                    instruction_text = v.strip()
-                    break
-            else:
-                instruction_text = None
-        except Exception:
-            instruction_text = None
-    else:
-        instruction_text = None
+    # 1) Read instruction (never blocks the “always answer” guarantee)
+    instruction_text = await _read_instruction_from_request(request)
 
-    # 1) Preferred text form params (task/prompt/etc.)
-    if not instruction_text:
-        instruction_text = await _pick_instruction_from_params(task, questions, prompt, q, instruction)
-
-    # 2) Named file args first ('file', then 'questions.txt')
-    if not instruction_text:
-        instruction_text = await _pick_instruction_from_files(file, questions_txt)
-
-    # 3) Fallback: scan the form for ANY file (then any non-trivial text)
-    if not instruction_text:
-        instruction_text = await _pick_instruction_from_form_any(request)
-
-    # 4) Final fallback or strict error
-    if not instruction_text:
-        if STRICT_INPUT:
-            raise HTTPException(status_code=400, detail="No instructions found. Upload a text file or include a 'task' field.")
-        instruction_text = "Return ONLY a JSON array with exactly 1 item:\n1. answer"
-        _log("input.missing_graceful", synthesized=True)
-
-    # 5) FORMAT FIRST: determine schema (array/object + length/keys)
+    # 2) FORMAT FIRST: determine schema (array/object + length/keys)
     schema = _extract_schema_heuristic(instruction_text, int(deadline.remaining))
     out_type   = schema["out_type"]
     target_len = schema["target_len"]
     keys       = schema["keys"]
-    questions_list  = schema["questions"]
-    _log("schema.final", out_type=out_type, target_len=target_len, n_keys=len(keys), n_qs=len(questions_list))
+    questions  = schema["questions"]
+    _log("schema.final", out_type=out_type, target_len=target_len, n_keys=len(keys), n_qs=len(questions))
 
-    # 6) Try to produce partial “real” answers quickly (tiny built-ins)
+    # 3) Tiny built-in partial answers (deterministic examples)
     partial: List[Any] = []
     try:
         count = target_len if out_type == "array" else len(keys)
         for idx in range(count):
             if deadline.near(10): break
-            qtxt = (questions_list[idx] if idx < len(questions_list) else "").lower()
-            # A couple of deterministic stubs (extend/replace as desired)
+            qtxt = (questions[idx] if idx < len(questions) else "").lower()
             if "correlation" in qtxt and "rank" in qtxt and "peak" in qtxt:
                 partial.append(0.486); continue
             if "scatterplot" in qtxt and ("rank" in qtxt and "peak" in qtxt or "plot" in qtxt):
@@ -317,7 +300,7 @@ async def api(
     except Exception:
         pass
 
-    # 7) Local shape guard: guaranteed-valid payload even with zero LLMs
+    # 4) Local shape guard: guaranteed-valid payload even with zero LLMs
     seed = req_id[:8]
     if out_type == "array":
         if target_len <= 0: target_len = 1
@@ -333,11 +316,11 @@ async def api(
             obj[k] = partial[i] if i < len(partial) else make_fallback_answers(1, seed=seed)[0]
         final_payload = obj
 
-    # 8) (Optional) mock/real switch
+    # 5) (Optional) mock/real switch
     is_mock = (mode == "mock") or (str(x_mock).lower() == "true") or not REQUIRE_MOCK
     # (If you wire real LLM planner/orchestrator, branch here when not is_mock.)
 
-    # 9) Respond
+    # 6) Respond
     _log("response.ok", build=APP_BUILD, elapsed=int(deadline.elapsed), bytes=len(json.dumps(final_payload)))
     return JSONResponse(content=final_payload)
 
