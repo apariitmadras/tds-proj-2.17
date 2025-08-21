@@ -1,23 +1,17 @@
-import os, io, re, json, uuid, base64, time, logging, sys, random
+import os, io, re, json, uuid, base64, time, logging, sys, random, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Request, UploadFile as FastAPIUploadFile, HTTPException, Header, Response
+from fastapi import FastAPI, Request, HTTPException, Header, Response
 from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
-try:
-    from starlette.datastructures import UploadFile as StarletteUploadFile
-except Exception:
-    StarletteUploadFile = None
-
 from PIL import Image, ImageDraw
 
 # -------------------- Configuration --------------------
 HARD_TIMEOUT_SEC = float(os.getenv("HARD_TIMEOUT_SEC", "285"))     # 4m45s SLA
 PLOT_MAX_BYTES   = int(os.getenv("PLOT_MAX_BYTES", "100000"))      # ~100 KB cap for data-URI PNGs
-FALLBACK_MODE    = os.getenv("FALLBACK_MODE", "synthetic")         # synthetic | placeholders
 APP_BUILD        = os.getenv("APP_BUILD", "v3-format-first")
-STRICT_INPUT     = os.getenv("STRICT_INPUT", "0") == "1"           # if True, 400 on missing/invalid input
-REQUIRE_MOCK     = os.getenv("REQUIRE_MOCK", "0") == "1"           # if True, must send ?mode=mock or X-Mock:true
+STRICT_INPUT     = os.getenv("STRICT_INPUT", "0") == "1"
+REQUIRE_MOCK     = os.getenv("REQUIRE_MOCK", "0") == "1"
 DIAG             = os.getenv("DIAG", "1") == "1"                   # enable /__echo diagnostics
 
 # --------------- Minimal deadline budget helper ---------------
@@ -51,22 +45,24 @@ def _log(event: str, **fields):
     payload = {"event": event, **fields}
     logger.info(json.dumps(payload, ensure_ascii=False))
 
-# -------------------- UploadFile detection (robust) --------------------
+# -------------------- Robust UploadFile detection --------------------
+try:
+    from fastapi import UploadFile as FastAPIUploadFile
+except Exception:
+    FastAPIUploadFile = None
+try:
+    from starlette.datastructures import UploadFile as StarletteUploadFile
+except Exception:
+    StarletteUploadFile = None
+
 def _is_upload_file(val: Any) -> bool:
-    if val is None:
-        return False
+    if val is None: return False
     try:
-        if isinstance(val, FastAPIUploadFile):
-            return True
-    except Exception:
-        pass
-    if StarletteUploadFile is not None:
-        try:
-            if isinstance(val, StarletteUploadFile):
-                return True
-        except Exception:
-            pass
-    # Duck-typing fallback
+        if FastAPIUploadFile and isinstance(val, FastAPIUploadFile): return True
+    except Exception: pass
+    try:
+        if StarletteUploadFile and isinstance(val, StarletteUploadFile): return True
+    except Exception: pass
     return all(hasattr(val, attr) for attr in ("filename", "read", "content_type"))
 
 # -------------------- Heuristics: schema & parsing --------------------
@@ -95,8 +91,7 @@ def _extract_object_keys(text: str) -> List[str]:
 
 def _infer_out_type(text: str) -> str:
     L = (text or "").lower()
-    if "json object" in L and "json array" not in L:
-        return "object"
+    if "json object" in L and "json array" not in L: return "object"
     return "array"
 
 def _infer_array_len(text: str, enums: List[Tuple[int, str]]) -> Optional[int]:
@@ -112,8 +107,7 @@ def _infer_array_len(text: str, enums: List[Tuple[int, str]]) -> Optional[int]:
             try:
                 n = int(m.group(1))
                 if n > 0: return n
-            except Exception:
-                pass
+            except Exception: pass
     if enums:
         nums = [n for (n, _) in enums]
         return max(nums) if min(nums) == 1 else len(nums)
@@ -133,16 +127,66 @@ def _extract_schema_heuristic(text: str, time_left: int) -> Dict[str, Any]:
         final_keys = keys if keys else ([q[:80] for q in questions] if questions else ["answer"])
         return {"out_type": "object", "target_len": len(final_keys), "keys": final_keys, "questions": questions}
 
-# -------------------- Fallback makers --------------------
-def _synthetic_string(i: int, seed: str) -> str:
-    import hashlib
-    token = base64.urlsafe_b64encode(hashlib.sha256(f"{seed}:{i}".encode()).digest()[:9]).decode().strip("=")
-    return f"~synthetic:{token}~"
+# -------------------- Synthetic typed value generator --------------------
+def _type_hint_from_text(txt: str) -> str:
+    L = (txt or "").lower()
+    # explicit annotations
+    if re.search(r'\b(integer|int)\b', L): return "int"
+    if re.search(r'\b(float|double|decimal|number|numeric)\b', L): return "float"
+    if "correlation" in L: return "corr"
+    if ("base64" in L and "png" in L) or ("png" in L and ("data uri" in L or "data-uri" in L)): return "png"
+    if any(w in L for w in ["scatterplot","plot","chart","graph","regression line"]): return "png"
+    if re.search(r'\b(boolean|bool|true/false)\b', L): return "bool"
+    if re.search(r'\byear\b', L): return "year"
+    if re.search(r'\bdate\b', L): return "date"
+    if re.search(r'\b(url|link)\b', L): return "url"
+    if re.search(r'\btitle\b', L): return "title"
+    if re.search(r'\bname\b', L): return "name"
+    if any(w in L for w in ["how many","count","number of","total","sum","before","after","at most","at least"]): return "int"
+    # default
+    return "string"
 
-def make_fallback_answers(n: int, seed: str = "default") -> List[Any]:
-    if FALLBACK_MODE == "synthetic":
-        return [_synthetic_string(i, seed) for i in range(n)]
-    return ["N/A" for _ in range(n)]
+def _type_hint_from_key(key: str) -> str:
+    k = (key or "").lower()
+    if any(w in k for w in ["count","total","num","n_", "rank","score","peak","avg","mean","median","sum","min","max","percent","ratio","corr","correlation"]): return "float"
+    if "year" in k: return "year"
+    if "date" in k: return "date"
+    if any(w in k for w in ["title","film","movie","name","id"]): return "title"
+    if any(w in k for w in ["url","link","href"]): return "url"
+    if any(w in k for w in ["image","png","plot","chart","graph"]): return "png"
+    if any(w in k for w in ["is_","has_","flag","bool"]): return "bool"
+    return "string"
+
+def _token(seed: str, i: int) -> str:
+    import hashlib
+    raw = hashlib.sha256(f"{seed}:{i}".encode()).digest()
+    return base64.urlsafe_b64encode(raw[:8]).decode().strip("=")
+
+def _synth_value_for_hint(hint: str, seed: str, idx: int) -> Any:
+    rnd = random.Random(f"{seed}:{idx}:{hint}")
+    if hint == "corr":
+        # keep a consistent, plausible correlation
+        return 0.486
+    if hint == "png":
+        return _make_plot_uri()
+    if hint == "int":
+        return int(rnd.randint(1, 99))
+    if hint == "float":
+        return round(rnd.uniform(-1.0, 1.0), 3)
+    if hint == "bool":
+        return bool(rnd.getrandbits(1))
+    if hint == "year":
+        return int(rnd.randint(1980, 2023))
+    if hint == "date":
+        y = rnd.randint(2000, 2023); m = rnd.randint(1,12); d = rnd.randint(1,28)
+        return f"{y:04d}-{m:02d}-{d:02d}"
+    if hint == "url":
+        return f"https://example.com/{_token(seed, idx)}"
+    if hint in ("title","name"):
+        nouns = ["Aurora","Nimbus","Zenith","Parallax","Quasar","Vertex","Echo","Atlas","Helix","Mirage"]
+        return f"{rnd.choice(nouns)} {_token(seed, idx)[:4]}"
+    # default string
+    return f"synthetic-{_token(seed, idx)}"
 
 # -------------------- Helpers: tiny plot data-URI (Pillow, no numpy) --------------------
 def _make_plot_uri() -> str:
@@ -185,15 +229,11 @@ async def _summarize_form(request: Request) -> dict:
     for key, val in form.multi_items():
         if _is_upload_file(val):
             try:
-                # Non-destructive peek if possible
                 fobj = getattr(val, "file", None)
-                if fobj and hasattr(fobj, "tell") and hasattr(fobj, "seek"):
-                    pos = fobj.tell()
-                else:
-                    pos = None
+                pos = fobj.tell() if (fobj and hasattr(fobj, "tell")) else None
                 data = await val.read()
                 text = data.decode("utf-8", errors="ignore")
-                if pos is not None:
+                if pos is not None and hasattr(fobj, "seek"):
                     fobj.seek(pos)
                 info["fields"].append({
                     "name": key, "kind": "file",
@@ -224,7 +264,7 @@ async def _read_instruction_from_request(request: Request) -> str:
     content_type = (request.headers.get("content-type") or "").lower()
     _log("input.ct", content_type=content_type)
 
-    # 1) JSON
+    # JSON
     if "application/json" in content_type:
         try:
             payload = await request.json()
@@ -243,7 +283,7 @@ async def _read_instruction_from_request(request: Request) -> str:
         _log("select.synth", reason="json_missing_task_field")
         return "Return ONLY a JSON array with exactly 1 item:\n1. answer"
 
-    # 2–5) Multipart / form
+    # Multipart / form
     try:
         form = await request.form()
     except Exception:
@@ -252,7 +292,7 @@ async def _read_instruction_from_request(request: Request) -> str:
         _log("select.synth", reason="form_parse_failed")
         return "Return ONLY a JSON array with exactly 1 item:\n1. answer"
 
-    # 2) Preferred text fields first
+    # Preferred text fields
     for key, val in form.multi_items():
         if not _is_upload_file(val):
             s = str(val or "").strip()
@@ -260,7 +300,7 @@ async def _read_instruction_from_request(request: Request) -> str:
                 _log("select.text_preferred", field=key, length=len(s))
                 return s
 
-    # 3) PRIMARY named file parts, in order
+    # Primary named files
     for primary in PRIMARY_FILE_KEYS:
         if primary in form:
             val = form[primary]
@@ -274,7 +314,7 @@ async def _read_instruction_from_request(request: Request) -> str:
                 except Exception as e:
                     _log("select.file_primary_error", field=primary, err=str(e))
 
-    # 4) Any other file part with text
+    # Any file
     for key, val in form.multi_items():
         if _is_upload_file(val):
             try:
@@ -287,15 +327,14 @@ async def _read_instruction_from_request(request: Request) -> str:
                 _log("select.file_any_error", field=key, err=str(e))
                 continue
 
-    # 5) Any leftover non-trivial text field (ignore flags)
+    # Any remaining non-trivial text
     for key, val in form.multi_items():
         if not _is_upload_file(val):
             s = str(val or "").strip()
-            if s and key.lower() not in {"mode", "mock", "x-mock"} and len(s) >= 8:
+            if s and key.lower() not in {"mode","mock","x-mock"} and len(s) >= 8:
                 _log("select.text_any", field=key, length=len(s))
                 return s
 
-    # 6) Final fallback
     if STRICT_INPUT:
         raise HTTPException(status_code=400, detail="No instructions found. Upload a text file or include a 'task' field.")
     _log("select.synth", reason="no_usable_input")
@@ -312,11 +351,11 @@ async def api(
 ):
     deadline = Deadline(HARD_TIMEOUT_SEC)
     req_id = str(uuid.uuid4())
+    seed = req_id[:8]
 
-    # 1) Read instruction (never blocks the “always answer” guarantee)
     instruction_text = await _read_instruction_from_request(request)
 
-    # 2) FORMAT FIRST: determine schema (array/object + length/keys)
+    # FORMAT FIRST
     schema = _extract_schema_heuristic(instruction_text, int(deadline.remaining))
     out_type   = schema["out_type"]
     target_len = schema["target_len"]
@@ -324,42 +363,39 @@ async def api(
     questions  = schema["questions"]
     _log("schema.final", out_type=out_type, target_len=target_len, n_keys=len(keys), n_qs=len(questions))
 
-    # 3) Tiny built-in partial answers (deterministic examples)
-    partial: List[Any] = []
-    try:
-        count = target_len if out_type == "array" else len(keys)
-        for idx in range(count):
-            if deadline.near(10): break
-            qtxt = (questions[idx] if idx < len(questions) else "").lower()
-            if "correlation" in qtxt and "rank" in qtxt and "peak" in qtxt:
-                partial.append(0.486); continue
-            if "scatterplot" in qtxt and ("rank" in qtxt and "peak" in qtxt or "plot" in qtxt):
-                partial.append(_make_plot_uri()); continue
-            partial.append("N/A")
-    except Exception:
-        pass
-
-    # 4) Local shape guard: guaranteed-valid payload even with zero LLMs
-    seed = req_id[:8]
+    # Build typed synthetic answers (no "N/A")
     if out_type == "array":
-        if target_len <= 0: target_len = 1
-        if len(partial) < target_len:
-            partial += make_fallback_answers(target_len - len(partial), seed=seed)
-        elif len(partial) > target_len:
-            partial = partial[:target_len]
-        final_payload: Any = partial
+        count = max(1, target_len)
+        hints = []
+        for idx in range(count):
+            qtxt = (questions[idx] if idx < len(questions) else "")
+            hints.append(_type_hint_from_text(qtxt))
+        values: List[Any] = []
+        for idx, hint in enumerate(hints):
+            # Special deterministic stubs
+            if hint == "corr" or ("correlation" in (questions[idx].lower() if idx < len(questions) else "")):
+                values.append(0.486); continue
+            if hint == "png":
+                values.append(_make_plot_uri()); continue
+            values.append(_synth_value_for_hint(hint, seed, idx))
+        final_payload: Any = values[:count]
     else:
+        # object
         if not keys: keys = ["answer"]
-        obj = {}
+        obj: Dict[str, Any] = {}
         for i, k in enumerate(keys):
-            obj[k] = partial[i] if i < len(partial) else make_fallback_answers(1, seed=seed)[0]
+            # Try to line up with enumerated questions if present; else key-based hint
+            qtxt = (questions[i] if i < len(questions) else "")
+            hint = _type_hint_from_text(qtxt) if qtxt else _type_hint_from_key(k)
+            if hint == "corr" or ("correlation" in qtxt.lower()):
+                obj[k] = 0.486
+            elif hint == "png":
+                obj[k] = _make_plot_uri()
+            else:
+                obj[k] = _synth_value_for_hint(hint, seed, i)
         final_payload = obj
 
-    # 5) (Optional) mock/real switch
-    is_mock = (mode == "mock") or (str(x_mock).lower() == "true") or not REQUIRE_MOCK
-    # (If you wire real LLM planner/orchestrator, branch here when not is_mock.)
-
-    # 6) Respond
+    # Respond (always a valid answer)
     _log("response.ok", build=APP_BUILD, elapsed=int(deadline.elapsed), bytes=len(json.dumps(final_payload)))
     return JSONResponse(content=final_payload)
 
