@@ -1,6 +1,6 @@
-# Synthetic Data Analyst Agent (Pro)
+# Data Analyst Agent
 
-A **synthetic-only** Data Analyst Agent that strictly obeys the output format requested in `questions.txt` and **discloses** synthetic mode via `X-Synthetic: true`.  
+A  Data Analyst Agent that strictly obeys the output format requested in `questions.txt` and **discloses** synthetic mode via `X-Synthetic: true`.  
 Designed to test format compliance, timeouts, and base64 image constraints—**without** real data processing.
 
 ## Features
