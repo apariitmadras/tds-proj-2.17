@@ -13,6 +13,7 @@ FALLBACK_MODE    = os.getenv("FALLBACK_MODE", "synthetic")         # synthetic |
 APP_BUILD        = os.getenv("APP_BUILD", "v3-format-first")
 STRICT_INPUT     = os.getenv("STRICT_INPUT", "0") == "1"           # if True, 400 on missing/invalid input
 REQUIRE_MOCK     = os.getenv("REQUIRE_MOCK", "0") == "1"           # if True, must send ?mode=mock or X-Mock:true
+DIAG             = os.getenv("DIAG", "1") == "1"                   # enable /__echo diagnostics
 
 # --------------- Minimal deadline budget helper ---------------
 class Deadline:
@@ -169,6 +170,51 @@ def _make_plot_uri() -> str:
         return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHYALtTyR2wQAAAABJRU5ErkJggg=="
     return uri
 
+# -------------------- Diagnostics: echo endpoint --------------------
+async def _summarize_form(request: Request) -> dict:
+    info = {
+        "content_type": request.headers.get("content-type"),
+        "fields": []
+    }
+    try:
+        form = await request.form()
+    except Exception as e:
+        return {"error": f"form-parse-failed: {e}"}
+
+    for key, val in form.multi_items():
+        if isinstance(val, UploadFile):
+            try:
+                pos = val.file.tell()
+                data = await val.read()
+                text = data.decode("utf-8", errors="ignore")
+                val.file.seek(pos)
+                info["fields"].append({
+                    "name": key, "kind": "file",
+                    "filename": getattr(val, "filename", None),
+                    "ctype": getattr(val, "content_type", None),
+                    "bytes": len(data),
+                    "text_preview": text[:120]
+                })
+            except Exception as e:
+                info["fields"].append({
+                    "name": key, "kind": "file", "peek_error": str(e)
+                })
+        else:
+            s = str(val or "")
+            info["fields"].append({
+                "name": key, "kind": "text",
+                "len": len(s),
+                "value_preview": s[:120]
+            })
+    return info
+
+@app.post("/__echo")
+async def __echo(request: Request):
+    if not DIAG:
+        return JSONResponse({"detail": "diag disabled; set DIAG=1"}, status_code=403)
+    info = await _summarize_form(request)
+    return JSONResponse(info)
+
 # -------------------- Instruction extraction --------------------
 PREFERRED_TEXT_KEYS = {"task", "questions", "prompt", "q", "instruction", "task_text"}
 PRIMARY_FILE_KEYS   = ("file", "questions.txt")
@@ -184,6 +230,7 @@ async def _read_instruction_from_request(request: Request) -> str:
       6) Synth 1-item instruction (unless STRICT_INPUT=1)
     """
     content_type = (request.headers.get("content-type") or "").lower()
+    _log("input.ct", content_type=content_type)
 
     # 1) JSON
     if "application/json" in content_type:
@@ -192,16 +239,16 @@ async def _read_instruction_from_request(request: Request) -> str:
         except Exception:
             if STRICT_INPUT:
                 raise HTTPException(status_code=400, detail="Invalid JSON body.")
-            _log("input.json_parse_failed"); 
+            _log("select.synth", reason="json_parse_failed")
             return "Return ONLY a JSON array with exactly 1 item:\n1. answer"
         for k in PREFERRED_TEXT_KEYS:
             v = payload.get(k)
             if isinstance(v, str) and v.strip():
-                _log("input.json", field=k, length=len(v))
+                _log("select.json", field=k, length=len(v))
                 return v.strip()
         if STRICT_INPUT:
             raise HTTPException(status_code=400, detail="Provide instructions under one of: " + ", ".join(sorted(PREFERRED_TEXT_KEYS)))
-        _log("input.json_missing", keys=list(payload.keys()) if isinstance(payload, dict) else "n/a")
+        _log("select.synth", reason="json_missing_task_field")
         return "Return ONLY a JSON array with exactly 1 item:\n1. answer"
 
     # 2–5) Multipart / form
@@ -210,7 +257,7 @@ async def _read_instruction_from_request(request: Request) -> str:
     except Exception:
         if STRICT_INPUT:
             raise HTTPException(status_code=400, detail="Invalid or missing multipart form-data.")
-        _log("input.form_parse_failed")
+        _log("select.synth", reason="form_parse_failed")
         return "Return ONLY a JSON array with exactly 1 item:\n1. answer"
 
     # 2) Preferred text fields first
@@ -218,7 +265,7 @@ async def _read_instruction_from_request(request: Request) -> str:
         if not isinstance(val, UploadFile):
             s = str(val or "").strip()
             if s and key.lower() in PREFERRED_TEXT_KEYS:
-                _log("input.multipart.text_preferred", field=key, length=len(s))
+                _log("select.text_preferred", field=key, length=len(s))
                 return s
 
     # 3) PRIMARY named file parts, in order
@@ -230,10 +277,10 @@ async def _read_instruction_from_request(request: Request) -> str:
                     data = await val.read()
                     text = (data or b"").decode("utf-8", errors="ignore").strip()
                     if text and not _looks_like_uploadfile_repr(text):
-                        _log("input.multipart.file_primary", field=primary, length=len(text), filename=getattr(val, "filename", None))
+                        _log("select.file_primary", field=primary, filename=getattr(val, "filename", None), length=len(text))
                         return text
                 except Exception as e:
-                    _log("input.multipart.file_primary_error", field=primary, err=str(e))
+                    _log("select.file_primary_error", field=primary, err=str(e))
 
     # 4) Any other file part with text
     for key, val in form.multi_items():
@@ -242,10 +289,10 @@ async def _read_instruction_from_request(request: Request) -> str:
                 data = await val.read()
                 text = (data or b"").decode("utf-8", errors="ignore").strip()
                 if text and not _looks_like_uploadfile_repr(text):
-                    _log("input.multipart.file_any", field=key, length=len(text), filename=getattr(val, "filename", None))
+                    _log("select.file_any", field=key, filename=getattr(val, "filename", None), length=len(text))
                     return text
             except Exception as e:
-                _log("input.multipart.file_any_error", field=key, err=str(e))
+                _log("select.file_any_error", field=key, err=str(e))
                 continue
 
     # 5) Any leftover non-trivial text field (ignore flags)
@@ -253,13 +300,13 @@ async def _read_instruction_from_request(request: Request) -> str:
         if not isinstance(val, UploadFile):
             s = str(val or "").strip()
             if s and key.lower() not in {"mode", "mock", "x-mock"} and len(s) >= 8:
-                _log("input.multipart.text_any", field=key, length=len(s))
+                _log("select.text_any", field=key, length=len(s))
                 return s
 
     # 6) Final fallback
     if STRICT_INPUT:
         raise HTTPException(status_code=400, detail="No instructions found. Upload a text file or include a 'task' field.")
-    _log("input.missing_graceful", synthesized=True)
+    _log("select.synth", reason="no_usable_input")
     return "Return ONLY a JSON array with exactly 1 item:\n1. answer"
 
 # -------------------- API --------------------
