@@ -1,9 +1,14 @@
 import os, io, re, json, uuid, base64, time, logging, sys, random
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Request, UploadFile, HTTPException, Header, Response
+from fastapi import FastAPI, Request, UploadFile as FastAPIUploadFile, HTTPException, Header, Response
 from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
+try:
+    from starlette.datastructures import UploadFile as StarletteUploadFile
+except Exception:
+    StarletteUploadFile = None
+
 from PIL import Image, ImageDraw
 
 # -------------------- Configuration --------------------
@@ -46,12 +51,29 @@ def _log(event: str, **fields):
     payload = {"event": event, **fields}
     logger.info(json.dumps(payload, ensure_ascii=False))
 
+# -------------------- UploadFile detection (robust) --------------------
+def _is_upload_file(val: Any) -> bool:
+    if val is None:
+        return False
+    try:
+        if isinstance(val, FastAPIUploadFile):
+            return True
+    except Exception:
+        pass
+    if StarletteUploadFile is not None:
+        try:
+            if isinstance(val, StarletteUploadFile):
+                return True
+        except Exception:
+            pass
+    # Duck-typing fallback
+    return all(hasattr(val, attr) for attr in ("filename", "read", "content_type"))
+
 # -------------------- Heuristics: schema & parsing --------------------
 def _looks_like_uploadfile_repr(s: str) -> bool:
     return bool(s) and ("UploadFile(" in s or "Headers(" in s)
 
 def _enumerated_lines(text: str) -> List[Tuple[int, str]]:
-    """Return [(num, content), ...] for '1. foo', '2) bar', '3- baz', '4] qux', '5: quux'."""
     out = []
     for ln in (text or "").splitlines():
         ln = ln.strip()
@@ -60,10 +82,6 @@ def _enumerated_lines(text: str) -> List[Tuple[int, str]]:
     return out
 
 def _extract_object_keys(text: str) -> List[str]:
-    """
-    Detect explicit object keys from 'keys: a, b, c', 'with keys [a, b, c]',
-    or JSON-like 'keys=["a","b"]' patterns.
-    """
     L = text or ""
     m = re.search(r'keys?\s*[:=]\s*(.+)$', L, flags=re.I | re.M)
     if not m: return []
@@ -102,15 +120,11 @@ def _infer_array_len(text: str, enums: List[Tuple[int, str]]) -> Optional[int]:
     return None
 
 def _extract_schema_heuristic(text: str, time_left: int) -> Dict[str, Any]:
-    """
-    Heuristic schema. Always returns usable shape even with zero LLMs.
-    """
     out_type = _infer_out_type(text)
     enums = _enumerated_lines(text)
     questions = [q for (_, q) in enums]
     keys = _extract_object_keys(text) if out_type == "object" else []
     expected_len = _infer_array_len(text, enums)
-
     if out_type == "array":
         target_len = expected_len if (isinstance(expected_len, int) and expected_len > 0) \
             else (len(questions) if questions else 1)
@@ -132,23 +146,16 @@ def make_fallback_answers(n: int, seed: str = "default") -> List[Any]:
 
 # -------------------- Helpers: tiny plot data-URI (Pillow, no numpy) --------------------
 def _make_plot_uri() -> str:
-    # Small synthetic scatter + dotted red regression line, fits under ~100KB
     w, h = 320, 240
     img = Image.new("RGB", (w, h), "white")
     d = ImageDraw.Draw(img)
-
-    # axes
     d.line([(40, h-30), (w-20, h-30)], fill=(0, 0, 0))
     d.line([(40, 20), (40, h-30)], fill=(0, 0, 0))
-
-    # fake scatter points along a trend
     random.seed(42)
     for i in range(10):
         x = 40 + int(i * (w - 80) / 9.0)
         y = (h - 30) - int(i * (h - 60) / 9.0 + random.randint(-10, 10))
         d.ellipse((x-3, y-3, x+3, y+3), fill=(0, 0, 0))
-
-    # dotted red regression line (approx diagonal)
     x1, y1 = 40, (h - 30)
     x2, y2 = w - 20, 20
     segs = 22
@@ -160,34 +167,34 @@ def _make_plot_uri() -> str:
         xb = x1 + (x2 - x1) * b
         yb = y1 + (y2 - y1) * b
         d.line([(xa, ya), (xb, yb)], fill=(220, 0, 0), width=2)
-
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     raw = buf.getvalue()
     uri = "data:image/png;base64," + base64.b64encode(raw).decode()
     if len(uri.encode("utf-8")) > PLOT_MAX_BYTES:
-        # 1x1 transparent PNG
         return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHYALtTyR2wQAAAABJRU5ErkJggg=="
     return uri
 
 # -------------------- Diagnostics: echo endpoint --------------------
 async def _summarize_form(request: Request) -> dict:
-    info = {
-        "content_type": request.headers.get("content-type"),
-        "fields": []
-    }
+    info = {"content_type": request.headers.get("content-type"), "fields": []}
     try:
         form = await request.form()
     except Exception as e:
         return {"error": f"form-parse-failed: {e}"}
-
     for key, val in form.multi_items():
-        if isinstance(val, UploadFile):
+        if _is_upload_file(val):
             try:
-                pos = val.file.tell()
+                # Non-destructive peek if possible
+                fobj = getattr(val, "file", None)
+                if fobj and hasattr(fobj, "tell") and hasattr(fobj, "seek"):
+                    pos = fobj.tell()
+                else:
+                    pos = None
                 data = await val.read()
                 text = data.decode("utf-8", errors="ignore")
-                val.file.seek(pos)
+                if pos is not None:
+                    fobj.seek(pos)
                 info["fields"].append({
                     "name": key, "kind": "file",
                     "filename": getattr(val, "filename", None),
@@ -196,16 +203,10 @@ async def _summarize_form(request: Request) -> dict:
                     "text_preview": text[:120]
                 })
             except Exception as e:
-                info["fields"].append({
-                    "name": key, "kind": "file", "peek_error": str(e)
-                })
+                info["fields"].append({"name": key, "kind": "file", "peek_error": str(e)})
         else:
             s = str(val or "")
-            info["fields"].append({
-                "name": key, "kind": "text",
-                "len": len(s),
-                "value_preview": s[:120]
-            })
+            info["fields"].append({"name": key, "kind": "text", "len": len(s), "value_preview": s[:120]})
     return info
 
 @app.post("/__echo")
@@ -220,15 +221,6 @@ PREFERRED_TEXT_KEYS = {"task", "questions", "prompt", "q", "instruction", "task_
 PRIMARY_FILE_KEYS   = ("file", "questions.txt")
 
 async def _read_instruction_from_request(request: Request) -> str:
-    """
-    Priority:
-      1) JSON body (task/prompt/etc.)
-      2) Preferred text fields in multipart/form
-      3) PRIMARY named file parts: 'file', then 'questions.txt'
-      4) Any other file with non-empty UTF-8 text
-      5) Any leftover text field (ignore tiny flags like 'mode=mock')
-      6) Synth 1-item instruction (unless STRICT_INPUT=1)
-    """
     content_type = (request.headers.get("content-type") or "").lower()
     _log("input.ct", content_type=content_type)
 
@@ -262,7 +254,7 @@ async def _read_instruction_from_request(request: Request) -> str:
 
     # 2) Preferred text fields first
     for key, val in form.multi_items():
-        if not isinstance(val, UploadFile):
+        if not _is_upload_file(val):
             s = str(val or "").strip()
             if s and key.lower() in PREFERRED_TEXT_KEYS:
                 _log("select.text_preferred", field=key, length=len(s))
@@ -272,7 +264,7 @@ async def _read_instruction_from_request(request: Request) -> str:
     for primary in PRIMARY_FILE_KEYS:
         if primary in form:
             val = form[primary]
-            if isinstance(val, UploadFile):
+            if _is_upload_file(val):
                 try:
                     data = await val.read()
                     text = (data or b"").decode("utf-8", errors="ignore").strip()
@@ -284,7 +276,7 @@ async def _read_instruction_from_request(request: Request) -> str:
 
     # 4) Any other file part with text
     for key, val in form.multi_items():
-        if isinstance(val, UploadFile):
+        if _is_upload_file(val):
             try:
                 data = await val.read()
                 text = (data or b"").decode("utf-8", errors="ignore").strip()
@@ -297,7 +289,7 @@ async def _read_instruction_from_request(request: Request) -> str:
 
     # 5) Any leftover non-trivial text field (ignore flags)
     for key, val in form.multi_items():
-        if not isinstance(val, UploadFile):
+        if not _is_upload_file(val):
             s = str(val or "").strip()
             if s and key.lower() not in {"mode", "mock", "x-mock"} and len(s) >= 8:
                 _log("select.text_any", field=key, length=len(s))
