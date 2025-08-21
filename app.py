@@ -1,12 +1,11 @@
-import os, io, re, json, uuid, base64
+import os, io, re, json, uuid, base64, time, logging, sys
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-import matplotlib.pyplot as plt
-
-from fastapi import FastAPI, Request, UploadFile, HTTPException, File, Form, Header, Response
+from fastapi import FastAPI, Request, UploadFile, HTTPException, Header, Response
 from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
+from PIL import Image, ImageDraw
+import random
 
 # -------------------- Configuration --------------------
 HARD_TIMEOUT_SEC = float(os.getenv("HARD_TIMEOUT_SEC", "285"))     # 4m45s SLA
@@ -14,9 +13,9 @@ PLOT_MAX_BYTES   = int(os.getenv("PLOT_MAX_BYTES", "100000"))      # ~100 KB cap
 FALLBACK_MODE    = os.getenv("FALLBACK_MODE", "synthetic")         # synthetic | placeholders
 APP_BUILD        = os.getenv("APP_BUILD", "v3-format-first")
 STRICT_INPUT     = os.getenv("STRICT_INPUT", "0") == "1"           # if True, 400 on missing/invalid input
+REQUIRE_MOCK     = os.getenv("REQUIRE_MOCK", "0") == "1"           # if True, requests must set ?mode=mock or X-Mock:true
 
 # --------------- Minimal deadline budget helper ---------------
-import time
 class Deadline:
     def __init__(self, seconds: float):
         self.start = time.time()
@@ -35,7 +34,6 @@ app.add_middleware(
 )
 
 # -------------------- Logging (stdout for Railway) --------------------
-import logging, sys
 logger = logging.getLogger("app")
 if not logger.handlers:
     handler = logging.StreamHandler(sys.stdout)
@@ -53,7 +51,7 @@ def _looks_like_uploadfile_repr(s: str) -> bool:
     return bool(s) and ("UploadFile(" in s or "Headers(" in s)
 
 def _enumerated_lines(text: str) -> List[Tuple[int, str]]:
-    """Return [(num, content), ...] for lines like: '1. foo', '2) bar', '3- baz', '4] qux', '5: quux'."""
+    """Return [(num, content), ...] for '1. foo', '2) bar', '3- baz', '4] qux', '5: quux'."""
     out = []
     for ln in (text or "").splitlines():
         ln = ln.strip()
@@ -63,7 +61,7 @@ def _enumerated_lines(text: str) -> List[Tuple[int, str]]:
 
 def _extract_object_keys(text: str) -> List[str]:
     """
-    Tries to detect explicit object keys from 'keys: a, b, c', 'with keys [a, b, c]',
+    Detect explicit object keys from 'keys: a, b, c', 'with keys [a, b, c]',
     or JSON-like 'keys=["a","b"]' patterns.
     """
     L = text or ""
@@ -131,20 +129,39 @@ def make_fallback_answers(n: int, seed: str = "default") -> List[Any]:
         return [_synthetic_string(i, seed) for i in range(n)]
     return ["N/A" for _ in range(n)]
 
-# -------------------- Helpers: tiny plot data-URI --------------------
+# -------------------- Helpers: tiny plot data-URI (Pillow, no numpy) --------------------
 def _make_plot_uri() -> str:
-    x = np.arange(1, 11)
-    y = x + np.random.RandomState(42).randn(len(x))
-    fig = plt.figure()
-    ax = fig.add_subplot(111)
-    ax.scatter(x, y)
-    coef = np.polyfit(x, y, 1)
-    yy = coef[0]*x + coef[1]
-    ax.plot(x, yy, linestyle=":", color="red")
-    ax.set_xlabel("Rank"); ax.set_ylabel("Peak")
+    # Small synthetic scatter + dotted red regression line, fits under ~100KB
+    w, h = 320, 240
+    img = Image.new("RGB", (w, h), "white")
+    d = ImageDraw.Draw(img)
+
+    # axes
+    d.line([(40, h-30), (w-20, h-30)], fill=(0, 0, 0))
+    d.line([(40, 20), (40, h-30)], fill=(0, 0, 0))
+
+    # fake scatter points along a trend
+    random.seed(42)
+    for i in range(10):
+        x = 40 + int(i * (w - 80) / 9.0)
+        y = (h - 30) - int(i * (h - 60) / 9.0 + random.randint(-10, 10))
+        d.ellipse((x-3, y-3, x+3, y+3), fill=(0, 0, 0))
+
+    # dotted red regression line (approx diagonal)
+    x1, y1 = 40, (h - 30)
+    x2, y2 = w - 20, 20
+    segs = 22
+    for t in range(segs):
+        a = t / segs
+        b = (t + 0.5) / segs
+        xa = x1 + (x2 - x1) * a
+        ya = y1 + (y2 - y1) * a
+        xb = x1 + (x2 - x1) * b
+        yb = y1 + (y2 - y1) * b
+        d.line([(xa, ya), (xb, yb)], fill=(220, 0, 0), width=2)
+
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    img.save(buf, format="PNG", optimize=True)
     raw = buf.getvalue()
     uri = "data:image/png;base64," + base64.b64encode(raw).decode()
     if len(uri.encode("utf-8")) > PLOT_MAX_BYTES:
@@ -156,6 +173,10 @@ def _make_plot_uri() -> str:
 PREFERRED_TEXT_KEYS = {"task", "questions", "prompt", "q", "instruction", "task_text"}
 
 async def _read_instruction_from_request(request: Request) -> str:
+    """
+    Correct order: JSON → preferred text fields → FILES → any text → synth (or 400 in strict).
+    This fixes the issue where a stray form field (e.g., mode=mock) was used instead of the file.
+    """
     content_type = (request.headers.get("content-type") or "")
 
     # JSON
@@ -165,7 +186,8 @@ async def _read_instruction_from_request(request: Request) -> str:
         except Exception:
             if STRICT_INPUT:
                 raise HTTPException(status_code=400, detail="Invalid JSON body.")
-            _log("input.json_parse_failed"); return "Return ONLY a JSON array with exactly 1 item:\n1. answer"
+            _log("input.json_parse_failed")
+            return "Return ONLY a JSON array with exactly 1 item:\n1. answer"
         for k in PREFERRED_TEXT_KEYS:
             v = payload.get(k)
             if isinstance(v, str) and v.strip():
@@ -176,7 +198,7 @@ async def _read_instruction_from_request(request: Request) -> str:
         _log("input.json_missing", keys=list(payload.keys()) if isinstance(payload, dict) else "n/a")
         return "Return ONLY a JSON array with exactly 1 item:\n1. answer"
 
-    # Multipart (or form)
+    # Multipart / form
     try:
         form = await request.form()
     except Exception:
@@ -185,7 +207,7 @@ async def _read_instruction_from_request(request: Request) -> str:
         _log("input.form_parse_failed")
         return "Return ONLY a JSON array with exactly 1 item:\n1. answer"
 
-    # 1) explicit text fields
+    # 1) Explicit text fields first
     for key, val in form.multi_items():
         if not isinstance(val, UploadFile):
             s = str(val or "").strip()
@@ -193,27 +215,27 @@ async def _read_instruction_from_request(request: Request) -> str:
                 _log("input.multipart.text", field=key, length=len(s))
                 return s
 
-    # 2) any non-empty text field
-    for key, val in form.multi_items():
-        if not isinstance(val, UploadFile):
-            s = str(val or "").strip()
-            if s:
-                _log("input.multipart.text_any", field=key, length=len(s))
-                return s
-
-    # 3) first non-empty file (accept any field name: "file", "questions.txt", etc.)
+    # 2) FILES (read the first non-empty upload; accept ANY field name)
     for key, val in form.multi_items():
         if isinstance(val, UploadFile):
             try:
                 data = await val.read()
                 text = (data or b"").decode("utf-8", errors="ignore").strip()
                 if text and not _looks_like_uploadfile_repr(text):
-                    _log("input.multipart.file", field=key, length=len(text))
+                    _log("input.multipart.file", field=key, length=len(text), filename=getattr(val, "filename", None))
                     return text
             except Exception:
                 continue
 
-    # 4) graceful synth if nothing usable
+    # 3) Any remaining non-empty text fields (true last resort; ignore tiny flag-like values)
+    for key, val in form.multi_items():
+        if not isinstance(val, UploadFile):
+            s = str(val or "").strip()
+            if s and key.lower() not in {"mode", "mock", "x-mock"} and len(s) >= 8:
+                _log("input.multipart.text_any", field=key, length=len(s))
+                return s
+
+    # 4) Graceful synth if nothing usable
     if STRICT_INPUT:
         raise HTTPException(status_code=400, detail="No instructions found. Upload a text file or include a 'task' field.")
     _log("input.missing_graceful", synthesized=True)
@@ -274,11 +296,9 @@ async def api(
             obj[k] = partial[i] if i < len(partial) else make_fallback_answers(1, seed=seed)[0]
         final_payload = obj
 
-    # 5) Optional: “synthetic mode” switch (default is ON unless you turn it off)
-    #    If you want to require an explicit mock flag, set REQUIRE_MOCK=1 in env.
-    REQUIRE_MOCK = os.getenv("REQUIRE_MOCK", "0") == "1"
+    # 5) (Optional) “synthetic mode” switch
     is_mock = (mode == "mock") or (str(x_mock).lower() == "true") or not REQUIRE_MOCK
-    # (If you later wire real LLM/planner/orchestrator, you can branch here.)
+    # (Branch here later if you wire actual LLM planner/orchestrator.)
 
     # 6) Respond
     _log("response.ok", build=APP_BUILD, elapsed=int(deadline.elapsed), bytes=len(json.dumps(final_payload)))
